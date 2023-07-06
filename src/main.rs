@@ -55,34 +55,13 @@ const PAGE_SIZE: usize = 4096;
 struct RWXMemory {
     mem_ptr: std::ptr::NonNull<u8>,
     mem_len: usize
-}
+}//TODO add option to disable reading/writing/execution after creation? Or make them opt-in?
 
 struct JITMemory {
     memory: RWXMemory,
-    groups: Vec<usize>,//Cannot keep slices to each group because we couldn't modify memory then!
-}
-
-//TODO perhaps instead in the future we should store a slice internally, which will keep track of
-//the length for us, and we can basically do an "Executable owned slice" by rounding up the length
-//to the nearest multiple of the page size, and then mmaping that many pages as executable
-
-#[repr(transparent)]
-struct RWXPage {
-    page_ptr: std::ptr::NonNull<u8>,
-}
-
-//TODO for safety never allow W+X?
-
-/*
-#[repr(transparent)]
-struct RXPage {
-    page_ptr: std::ptr::NonNull<u8>,
-}
-*/
-
-struct JITPage {
-    page: RWXPage,
-    //groups: Vec<std::ptr::NonNull<u8>>,
+    //Cannot keep slices to each group because we couldn't modify memory then!
+    //Keep all of the end indices of each group instead (exclusive)
+    group_ends: Vec<usize>
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -100,10 +79,12 @@ impl RWXMemory {
             return None;
         }
 
+        let actual_size = size_bytes;//May need to change this in the future
+
         let mem_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                size_bytes,
+                actual_size,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_ANON | libc::MAP_PRIVATE,
                 -1,
@@ -115,7 +96,7 @@ impl RWXMemory {
             None
         } else if mem_ptr.is_null() {
             //mmap() could return a pointer to page 0 in rare circumstances. We don't support this
-            unsafe { libc::munmap(mem_ptr, size_bytes); }
+            unsafe { libc::munmap(mem_ptr, actual_size); }
             None
         } else {
             //Zero out the memory just in case we're on a platform that didn't do this
@@ -124,20 +105,19 @@ impl RWXMemory {
             Some(
                 RWXMemory {
                     mem_ptr: std::ptr::NonNull::new(mem_ptr).expect("We already checked for null").cast(),
-                    mem_len: size_bytes
+                    mem_len: actual_size,
                 }
             )
         }
     }
 
-    fn len(&self) -> usize {
-        self.mem_len
-    }
-
     //THIS DOES NOT TAKE OWNERSHIP; YOU MUST NOT MUNMAP THE PAGE YOURSELF
+    //Kind of redundant since the slices provide as_ptr(), so we comment it out
+    /*
     fn as_ptr(&self) -> std::ptr::NonNull<u8> {
         self.mem_ptr
     }
+    */
 
     //THIS DOES TAKE OWNERSHIP; YOU MUST MUNMAP THE PAGE YOURSELF (to avoid a memory leak)
     fn take_ptr(self) -> std::ptr::NonNull<u8> {
@@ -147,90 +127,80 @@ impl RWXMemory {
     }
 }
 
-impl RWXPage {
-    fn new() -> Option<Self> {
-        let page_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                PAGE_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
+impl JITMemory {
+    fn new(size_bytes: usize) -> Option<Self> {
+        let mut memory = RWXMemory::new(size_bytes)?;
 
-        if page_ptr == libc::MAP_FAILED {
-            None
-        } else if page_ptr.is_null() {
-            //mmap() could return a pointer to page 0 in rare circumstances
-            //We don't support this case
-            unsafe { libc::munmap(page_ptr, PAGE_SIZE); }
-            None
-        } else {
-            Some(
-                RWXPage {
-                    page_ptr: std::ptr::NonNull::new(page_ptr).unwrap().cast()
-                }
-            )
-        }
-    }
+        //TODO do this differently for other architectures
+        //Fill the page with a nop slide into an illegal opcode to help catch bugs
+        //IT IS EXPECTED THAT THE BYTES THAT ARE WRITTEN RETURN values that make sense for you
+        memory.fill(0x90);//nop
+        let len = memory.len();
+        debug_assert!(len >= 2);
+        memory[len - 2] = 0x0F;//Start of ud
+        memory[len - 1] = 0xFF;//End of ud
+        //End of amd64 specific code
 
-    //THIS DOES NOT TAKE OWNERSHIP; YOU MUST NOT MUNMAP THE PAGE YOURSELF
-    fn as_ptr(&self) -> std::ptr::NonNull<u8> {
-        self.page_ptr
-    }
-
-    //THIS DOES TAKE OWNERSHIP; YOU MUST MUNMAP THE PAGE YOURSELF (to avoid a memory leak)
-    fn take_ptr(self) -> std::ptr::NonNull<u8> {
-        let ptr = self.page_ptr;
-        std::mem::forget(self);
-        ptr
-    }
-}
-
-impl JITPage {
-    fn new() -> Option<Self> {
-        let jitpage = JITPage {
-                page: RWXPage::new()?,
-        };
-
-        //Initialize the page
-        unsafe {
-            let page_ptr = jitpage.page.as_ptr().as_ptr();
-
-            //Fill the page with a nop slide into an illegal opcode to help catch bugs
-            //IT IS EXPECTED THAT THE BYTES THAT ARE WRITTEN RETURN values that make sense for you
-            for i in 0..PAGE_SIZE {
-                *page_ptr.add(i) = 0x90;
+        Some(
+            JITMemory {
+                memory,
+                group_ends: Vec::new()
             }
-            debug_assert!(PAGE_SIZE >= 2);
-            *page_ptr.add(PAGE_SIZE - 2) = 0x0F;
-            *page_ptr.add(PAGE_SIZE - 1) = 0xFF;
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    fn remaining_space(&self) -> usize {
+        if self.group_ends.is_empty() {
+            self.len()
+        } else {
+            self.len() - self.group_ends.last().expect("We already checked that group_ends is not empty")
         }
-        
-        Some(jitpage)
+    }
+
+    fn num_byte_groups(&self) -> usize {
+        self.group_ends.len()
     }
 
     fn add_byte_group(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        //TODO this is only successful if the instruction fits in the page in the space we have left
-        //TODO perhaps dynamically increase the page size if we run out of space?
-        //TODO also keep track of the locations of each byte group which could be useful if
-        //we wish to jump to a specific byte group
-        //TODO also 
-        Err(())
+        if self.remaining_space() < bytes.len() {
+            Err(())
+        } else {
+            let group_start_index;
+            if self.group_ends.is_empty() {
+                group_start_index = 0;
+            } else {
+                group_start_index = *self.group_ends.last().expect("We already checked that group_ends is not empty");
+            }
+            let group_end_index = group_start_index + bytes.len();//Exclusive
+
+            self.memory[group_start_index..group_end_index].copy_from_slice(bytes);
+            self.group_ends.push(group_end_index);
+
+            Ok(())
+        }
     }
 
-    //Transmute these functions yourself to the correct function pointer type for you
-    //THIS DOES NOT TAKE OWNERSHIP; YOU MUST NOT MUNMAP THE PAGE YOURSELF
-    //TODO add unsafe macros to do the transmute
-
-    fn get_ptr_to_start(&self) -> std::ptr::NonNull<u8> {//Equivalent to execute_at_byte_group(0), but faster
-        self.page.as_ptr()
+    //You will likely have to transmute the function pointer to the correct type for your purposes
+    //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group()) };
+    fn fn_ptr_to_group(&self, group: usize) -> unsafe fn() {
+        let mut base_memory_ptr = self.memory.as_ptr();
+    
+        if group == 0 {
+            unsafe { std::mem::transmute(base_memory_ptr) }
+        } else {
+            let offset = self.group_ends[group - 1];
+            unsafe { std::mem::transmute(base_memory_ptr.add(offset)) }
+        }
     }
 
-    fn get_ptr_to_byte_group(&self, group: usize) -> std::ptr::NonNull<u8> {
-        todo!()
+    //You will likely have to transmute the function pointer to the correct type for your purposes
+    //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_start()) };
+    fn fn_ptr_to_start(&self) -> unsafe fn() {//Equivalent to fn_ptr_to_group(0), but also works when there are no groups
+        unsafe { std::mem::transmute(self.memory.as_ptr()) }
     }
 }
 
@@ -264,27 +234,23 @@ impl AsMut<[u8]> for RWXMemory {
     }
 }
 
-impl std::ops::Index<usize> for RWXMemory {
-    type Output = u8;
+//RWXMemory is a smart pointer, so it is okay practice to implement Deref and DerefMut
+impl std::ops::Deref for RWXMemory {
+    type Target = [u8];
 
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.as_ref()[index]
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
     }
 }
 
-impl std::ops::IndexMut<usize> for RWXMemory {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.as_mut()[index]
+//RWXMemory is a smart pointer, so it is okay practice to implement Deref and DerefMut
+impl std::ops::DerefMut for RWXMemory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
     }
 }
 
-impl Drop for RWXPage {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.page_ptr.as_ptr().cast(), PAGE_SIZE);
-        }
-    }
-}
+//TODO add more traits similar to those
 
 /* ------------------------------------------------------------------------------------------------
  * Functions
@@ -293,71 +259,24 @@ impl Drop for RWXPage {
 fn main() {
     println!("Hello, world!");
 
-    let mut rwxmem = RWXMemory::new(1024).expect("Failed to allocate memory");
-    rwxmem[0] = 0x90;
+    let mut jitmemory = JITMemory::new(4096).expect("Failed to allocate a page of memory");
 
-    /*
-    let jitpage = JITPage::new().expect("Failed to allocate a page of memory");
-    unsafe {
-        let start_fn_ptr: unsafe fn() = std::mem::transmute(jitpage.get_ptr_to_start().as_ptr());
-        start_fn_ptr();
-    }
-    
-    let rwxpage = RWXPage::new().expect("Failed to allocate a page of memory");
-    let ptr = rwpage.as_ptr();
-    let owned_ptr = rwpage.take_ptr();
+    //mov rax, 0x12345678
+    jitmemory.add_byte_group(&[0x48, 0xC7, 0xC0, 0x78, 0x56, 0x34, 0x12]).expect("Failed to add a byte group");
+    //ret
+    jitmemory.add_byte_group(&[0xC3]).expect("Failed to add a byte group");
 
-    //Initial experiments
-    let page_ptr = allocate_rwx_page().expect("Failed to allocate a page of memory");
-    let jit_function = jit(page_ptr);
-    println!("jit_function() returned {}", jit_function());
-    free_rwx_page(page_ptr);
-    */
-}
+    let fn_ptr: extern "C" fn() -> u32 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_start()) };
+    println!("fn_ptr() returned 0x{:X}", fn_ptr());
 
-fn jit(rwx_page_ptr_to_use: std::ptr::NonNull<std::ffi::c_void>) -> fn() -> i32 {
-    let page_ptr = rwx_page_ptr_to_use.as_ptr() as *mut u8;
-    
-    unsafe {
-        //mov rax, 0x3
-        *page_ptr.offset(0) = 0x48;
-        *page_ptr.offset(1) = 0xC7;
-        *page_ptr.offset(2) = 0xC0;
-        *page_ptr.offset(3) = 0x03;
-        *page_ptr.offset(4) = 0x00;
-        *page_ptr.offset(5) = 0x00;
-        *page_ptr.offset(6) = 0x00;
+    //Skip the mov. The result will be unpredictable, but it will not crash (we just skip right to the ret)
+    let unpredictable_fn_ptr: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group(1)) };
+    println!("unpredictable_fn_ptr() returned 0x{:X}", unsafe { unpredictable_fn_ptr() });
 
-        //ret
-        *page_ptr.offset(7) = 0xC3;
-
-        std::mem::transmute(page_ptr)
-    }
-}
-
-fn allocate_rwx_page() -> Option<std::ptr::NonNull<std::ffi::c_void>> {
-    let page_ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            -1,
-            0,
-        )
-    };
-
-    if page_ptr == libc::MAP_FAILED {
-        None
-    } else {
-        Some(std::ptr::NonNull::new(page_ptr).expect("We don't handle the case where mmap allocates a page for us at address 0"))
-    }
-}
-
-fn free_rwx_page(page_ptr: std::ptr::NonNull<std::ffi::c_void>) {
-    unsafe {
-        libc::munmap(page_ptr.as_ptr(), 4096);
-    }
+    //This will cause an illegal instruction exception
+    /*unsafe {
+        jitmemory.fn_ptr_to_start()();
+    }*/
 }
 
 /* ------------------------------------------------------------------------------------------------
