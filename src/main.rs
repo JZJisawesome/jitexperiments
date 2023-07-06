@@ -38,7 +38,7 @@
  * Constants
  * --------------------------------------------------------------------------------------------- */
 
-const PAGE_SIZE: usize = 4096;
+//TODO
 
 /* ------------------------------------------------------------------------------------------------
  * Static Variables
@@ -120,7 +120,7 @@ impl RWXMemory {
     */
 
     //THIS DOES TAKE OWNERSHIP; YOU MUST MUNMAP THE PAGE YOURSELF (to avoid a memory leak)
-    fn take_ptr(self) -> std::ptr::NonNull<u8> {
+    fn into_raw(self) -> std::ptr::NonNull<u8> {
         let ptr = self.mem_ptr;
         std::mem::forget(self);
         ptr
@@ -129,21 +129,9 @@ impl RWXMemory {
 
 impl JITMemory {
     fn new(size_bytes: usize) -> Option<Self> {
-        let mut memory = RWXMemory::new(size_bytes)?;
-
-        //TODO do this differently for other architectures
-        //Fill the page with a nop slide into an illegal opcode to help catch bugs
-        //IT IS EXPECTED THAT THE BYTES THAT ARE WRITTEN RETURN values that make sense for you
-        memory.fill(0x90);//nop
-        let len = memory.len();
-        debug_assert!(len >= 2);
-        memory[len - 2] = 0x0F;//Start of ud
-        memory[len - 1] = 0xFF;//End of ud
-        //End of amd64 specific code
-
         Some(
             JITMemory {
-                memory,
+                memory: RWXMemory::new(size_bytes)?,
                 group_ends: Vec::new()
             }
         )
@@ -185,22 +173,26 @@ impl JITMemory {
     }
 
     //You will likely have to transmute the function pointer to the correct type for your purposes
-    //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group()) };
-    fn fn_ptr_to_group(&self, group: usize) -> unsafe fn() {
-        let mut base_memory_ptr = self.memory.as_ptr();
-    
-        if group == 0 {
-            unsafe { std::mem::transmute(base_memory_ptr) }
+    //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group()?) };
+    fn fn_ptr_to_group(&self, group: usize) -> Option<unsafe fn()> {
+        if self.num_byte_groups() == 0 {
+            None
         } else {
-            let offset = self.group_ends[group - 1];
-            unsafe { std::mem::transmute(base_memory_ptr.add(offset)) }
+            let mut base_memory_ptr = self.memory.as_ptr();
+        
+            if group == 0 {
+                Some(unsafe { std::mem::transmute(base_memory_ptr) })
+            } else {
+                let offset = self.group_ends[group - 1];
+                Some(unsafe { std::mem::transmute(base_memory_ptr.add(offset)) })
+            }
         }
     }
 
     //You will likely have to transmute the function pointer to the correct type for your purposes
-    //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_start()) };
-    fn fn_ptr_to_start(&self) -> unsafe fn() {//Equivalent to fn_ptr_to_group(0), but also works when there are no groups
-        unsafe { std::mem::transmute(self.memory.as_ptr()) }
+    //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_start()?) };
+    fn fn_ptr_to_start(&self) -> Option<unsafe fn()> {//Equivalent to fn_ptr_to_group(0)
+        self.fn_ptr_to_group(0)
     }
 }
 
@@ -259,24 +251,33 @@ impl std::ops::DerefMut for RWXMemory {
 fn main() {
     println!("Hello, world!");
 
-    let mut jitmemory = JITMemory::new(4096).expect("Failed to allocate a page of memory");
+    let mut jitmemory = JITMemory::new(10000).expect("Failed to allocate memory");
 
     //mov rax, 0x12345678
     jitmemory.add_byte_group(&[0x48, 0xC7, 0xC0, 0x78, 0x56, 0x34, 0x12]).expect("Failed to add a byte group");
     //ret
     jitmemory.add_byte_group(&[0xC3]).expect("Failed to add a byte group");
 
-    let fn_ptr: extern "C" fn() -> u32 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_start()) };
+    let fn_ptr: extern "C" fn() -> u32 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_start().unwrap()) };
     println!("fn_ptr() returned 0x{:X}", fn_ptr());
 
     //Skip the mov. The result will be unpredictable, but it will not crash (we just skip right to the ret)
-    let unpredictable_fn_ptr: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group(1)) };
+    let unpredictable_fn_ptr: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group(1).unwrap()) };
     println!("unpredictable_fn_ptr() returned 0x{:X}", unsafe { unpredictable_fn_ptr() });
 
-    //This will cause an illegal instruction exception
-    /*unsafe {
-        jitmemory.fn_ptr_to_start()();
-    }*/
+    //Add some more instructions to multiple two u64s
+
+    //mov rcx, rsi
+    jitmemory.add_byte_group(&[0x48, 0x89, 0xF1]).expect("Failed to add a byte group");
+    //mov rax, rdi
+    jitmemory.add_byte_group(&[0x48, 0x89, 0xF8]).expect("Failed to add a byte group");
+    //mul rcx
+    jitmemory.add_byte_group(&[0x48, 0xF7, 0xE1]).expect("Failed to add a byte group");
+    //ret
+    jitmemory.add_byte_group(&[0xC3]).expect("Failed to add a byte group");
+
+    let multiply: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group(2).unwrap()) };
+    println!("3 * 7 = {}", multiply(3, 7));
 }
 
 /* ------------------------------------------------------------------------------------------------
