@@ -50,6 +50,10 @@ const PAGE_SIZE: usize = 4096;
  * Types
  * --------------------------------------------------------------------------------------------- */
 
+struct RWXMemory<'a> {
+    memory: &'a mut [u8]//TODO is this okay to do with lifetimes?
+}
+
 //TODO perhaps instead in the future we should store a slice internally, which will keep track of
 //the length for us, and we can basically do an "Executable owned slice" by rounding up the length
 //to the nearest multiple of the page size, and then mmaping that many pages as executable
@@ -70,16 +74,54 @@ struct RXPage {
 
 struct JITPage {
     page: RWXPage,
-}
-
-enum JITPageExecutionResult {
-    EndOfPage,
-    //TODO others
+    //groups: Vec<std::ptr::NonNull<u8>>,
 }
 
 /* ------------------------------------------------------------------------------------------------
  * Associated Functions and Methods
  * --------------------------------------------------------------------------------------------- */
+
+impl RWXMemory<'_> {
+    pub fn new(size_bytes: usize) -> Option<Self> {//Guaranteed to get at least this size (but may be larger)
+        //Determine the length to pass to mmap()
+        if size_bytes == 0 {
+            //Not allowed to mmap() a zero length region
+            return None;
+        } else if size_bytes > isize::MAX as usize {
+            //Requirement on Rust slices
+            return None;
+        }
+
+        let mem_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size_bytes,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+
+        if mem_ptr == libc::MAP_FAILED {
+            None
+        } else if mem_ptr.is_null() {
+            //mmap() could return a pointer to page 0 in rare circumstances
+            //We don't support this case
+            unsafe { libc::munmap(mem_ptr, size_bytes); }
+            None
+        } else {
+            //Zero out the memory just in case we're on a platform that didn't do this
+            unsafe { std::ptr::write_bytes(mem_ptr, 0, size_bytes); }
+
+            Some(
+                RWXMemory {
+                    memory: unsafe { std::slice::from_raw_parts_mut(mem_ptr as *mut u8, size_bytes) }
+                }
+            )
+        }
+    }
+}
 
 impl RWXPage {
     fn new() -> Option<Self> {
@@ -87,8 +129,7 @@ impl RWXPage {
             libc::mmap(
                 std::ptr::null_mut(),
                 PAGE_SIZE,
-                //libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::PROT_READ | libc::PROT_WRITE,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_ANON | libc::MAP_PRIVATE,
                 -1,
                 0,
@@ -134,27 +175,20 @@ impl JITPage {
         unsafe {
             let page_ptr = jitpage.page.as_ptr().as_ptr();
 
-            //Fill the page with amd64 nops (nop slide to the end)
+            //Fill the page with a nop slide into an illegal opcode to help catch bugs
+            //IT IS EXPECTED THAT THE BYTES THAT ARE WRITTEN RETURN values that make sense for you
             for i in 0..PAGE_SIZE {
                 *page_ptr.add(i) = 0x90;
             }
-
-            //Return 0 if we ever hit the end of the page
-            debug_assert!(PAGE_SIZE >= 3);
-
-            //Set rax to 0 (writing the lower 32 bits also clears the upper 32 bits)
-            //xor eax, eax
-            *page_ptr.add(PAGE_SIZE - 3) = 0x31;
-            *page_ptr.add(PAGE_SIZE - 2) = 0xC0;
-
-            //ret
-            *page_ptr.add(PAGE_SIZE - 1) = 0xC3;
+            debug_assert!(PAGE_SIZE >= 2);
+            *page_ptr.add(PAGE_SIZE - 2) = 0x0F;
+            *page_ptr.add(PAGE_SIZE - 1) = 0xFF;
         }
         
         Some(jitpage)
     }
 
-    fn add_byte_group(&mut self, instruction: &[u8]) -> Result<(), ()> {
+    fn add_byte_group(&mut self, bytes: &[u8]) -> Result<(), ()> {
         //TODO this is only successful if the instruction fits in the page in the space we have left
         //TODO perhaps dynamically increase the page size if we run out of space?
         //TODO also keep track of the locations of each byte group which could be useful if
@@ -163,14 +197,16 @@ impl JITPage {
         Err(())
     }
 
-    fn execute_from_start(&self) -> JITPageExecutionResult {//Equivalent to execute_at_byte_group(0)
-        let function_ptr = self.page.as_ptr().as_ptr().cast::<fn() -> u64>();
-        JITPageExecutionResult::EndOfPage
+    //Transmute these functions yourself to the correct function pointer type for you
+    //THIS DOES NOT TAKE OWNERSHIP; YOU MUST NOT MUNMAP THE PAGE YOURSELF
+    //TODO add unsafe macros to do the transmute
+
+    fn get_ptr_to_start(&self) -> std::ptr::NonNull<u8> {//Equivalent to execute_at_byte_group(0), but faster
+        self.page.as_ptr()
     }
 
-    fn execute_at_byte_group(&self, byte_group_index: usize) -> JITPageExecutionResult {
-        //TODO
-        JITPageExecutionResult::EndOfPage
+    fn get_ptr_to_byte_group(&self, group: usize) -> std::ptr::NonNull<u8> {
+        todo!()
     }
 }
 
@@ -183,6 +219,26 @@ impl JITPage {
 /* ------------------------------------------------------------------------------------------------
  * Trait Implementations
  * --------------------------------------------------------------------------------------------- */
+
+impl Drop for RWXMemory<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.memory.as_mut_ptr().cast(), self.memory.len());
+        }
+    }
+}
+
+impl AsRef<[u8]> for RWXMemory<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.memory
+    }
+}
+
+impl AsMut<[u8]> for RWXMemory<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.memory
+    }
+}
 
 impl Drop for RWXPage {
     fn drop(&mut self) {
@@ -199,7 +255,15 @@ impl Drop for RWXPage {
 fn main() {
     println!("Hello, world!");
 
-    let rwxpage = RWXPage::new().expect("Failed to allocate a page of memory");
+    let jitpage = JITPage::new().expect("Failed to allocate a page of memory");
+
+    unsafe {
+        let start_fn_ptr: unsafe fn() = std::mem::transmute(jitpage.get_ptr_to_start().as_ptr());
+        start_fn_ptr();
+    }
+
+    
+    //let rwxpage = RWXPage::new().expect("Failed to allocate a page of memory");
     //let ptr = rwpage.as_ptr();
     //let owned_ptr = rwpage.take_ptr();
 
