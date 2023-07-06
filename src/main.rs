@@ -50,8 +50,16 @@ const PAGE_SIZE: usize = 4096;
  * Types
  * --------------------------------------------------------------------------------------------- */
 
-struct RWXMemory<'a> {
-    memory: &'a mut [u8]//TODO is this okay to do with lifetimes?
+#[derive(Debug)]//We will NEVER dervie Copy or Clone. We may manually implement Clone in the future
+//But this will never be Copy
+struct RWXMemory {
+    mem_ptr: std::ptr::NonNull<u8>,
+    mem_len: usize
+}
+
+struct JITMemory {
+    memory: RWXMemory,
+    groups: Vec<usize>,//Cannot keep slices to each group because we couldn't modify memory then!
 }
 
 //TODO perhaps instead in the future we should store a slice internally, which will keep track of
@@ -81,7 +89,7 @@ struct JITPage {
  * Associated Functions and Methods
  * --------------------------------------------------------------------------------------------- */
 
-impl RWXMemory<'_> {
+impl RWXMemory {
     pub fn new(size_bytes: usize) -> Option<Self> {//Guaranteed to get at least this size (but may be larger)
         //Determine the length to pass to mmap()
         if size_bytes == 0 {
@@ -106,8 +114,7 @@ impl RWXMemory<'_> {
         if mem_ptr == libc::MAP_FAILED {
             None
         } else if mem_ptr.is_null() {
-            //mmap() could return a pointer to page 0 in rare circumstances
-            //We don't support this case
+            //mmap() could return a pointer to page 0 in rare circumstances. We don't support this
             unsafe { libc::munmap(mem_ptr, size_bytes); }
             None
         } else {
@@ -116,10 +123,27 @@ impl RWXMemory<'_> {
 
             Some(
                 RWXMemory {
-                    memory: unsafe { std::slice::from_raw_parts_mut(mem_ptr as *mut u8, size_bytes) }
+                    mem_ptr: std::ptr::NonNull::new(mem_ptr).expect("We already checked for null").cast(),
+                    mem_len: size_bytes
                 }
             )
         }
+    }
+
+    fn len(&self) -> usize {
+        self.mem_len
+    }
+
+    //THIS DOES NOT TAKE OWNERSHIP; YOU MUST NOT MUNMAP THE PAGE YOURSELF
+    fn as_ptr(&self) -> std::ptr::NonNull<u8> {
+        self.mem_ptr
+    }
+
+    //THIS DOES TAKE OWNERSHIP; YOU MUST MUNMAP THE PAGE YOURSELF (to avoid a memory leak)
+    fn take_ptr(self) -> std::ptr::NonNull<u8> {
+        let ptr = self.mem_ptr;
+        std::mem::forget(self);
+        ptr
     }
 }
 
@@ -220,23 +244,37 @@ impl JITPage {
  * Trait Implementations
  * --------------------------------------------------------------------------------------------- */
 
-impl Drop for RWXMemory<'_> {
+impl Drop for RWXMemory {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.memory.as_mut_ptr().cast(), self.memory.len());
+            libc::munmap(self.mem_ptr.as_ptr().cast(), self.mem_len);
         }
     }
 }
 
-impl AsRef<[u8]> for RWXMemory<'_> {
+impl AsRef<[u8]> for RWXMemory {
     fn as_ref(&self) -> &[u8] {
-        self.memory
+        unsafe { std::slice::from_raw_parts(self.mem_ptr.as_ptr(), self.mem_len) }
     }
 }
 
-impl AsMut<[u8]> for RWXMemory<'_> {
+impl AsMut<[u8]> for RWXMemory {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.memory
+        unsafe { std::slice::from_raw_parts_mut(self.mem_ptr.as_ptr(), self.mem_len) }
+    }
+}
+
+impl std::ops::Index<usize> for RWXMemory {
+    type Output = u8;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_ref()[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for RWXMemory {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut()[index]
     }
 }
 
@@ -255,23 +293,26 @@ impl Drop for RWXPage {
 fn main() {
     println!("Hello, world!");
 
-    let jitpage = JITPage::new().expect("Failed to allocate a page of memory");
+    let mut rwxmem = RWXMemory::new(1024).expect("Failed to allocate memory");
+    rwxmem[0] = 0x90;
 
+    /*
+    let jitpage = JITPage::new().expect("Failed to allocate a page of memory");
     unsafe {
         let start_fn_ptr: unsafe fn() = std::mem::transmute(jitpage.get_ptr_to_start().as_ptr());
         start_fn_ptr();
     }
-
     
-    //let rwxpage = RWXPage::new().expect("Failed to allocate a page of memory");
-    //let ptr = rwpage.as_ptr();
-    //let owned_ptr = rwpage.take_ptr();
+    let rwxpage = RWXPage::new().expect("Failed to allocate a page of memory");
+    let ptr = rwpage.as_ptr();
+    let owned_ptr = rwpage.take_ptr();
 
     //Initial experiments
     let page_ptr = allocate_rwx_page().expect("Failed to allocate a page of memory");
     let jit_function = jit(page_ptr);
     println!("jit_function() returned {}", jit_function());
     free_rwx_page(page_ptr);
+    */
 }
 
 fn jit(rwx_page_ptr_to_use: std::ptr::NonNull<std::ffi::c_void>) -> fn() -> i32 {
