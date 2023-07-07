@@ -20,6 +20,7 @@
  * Submodules
  * --------------------------------------------------------------------------------------------- */
 
+mod amd64asm;
 //TODO (includes "mod ..." and "pub mod ...")
 
 /* ------------------------------------------------------------------------------------------------
@@ -100,7 +101,7 @@ impl RWXMemory {
             None
         } else {
             //Zero out the memory just in case we're on a platform that didn't do this
-            unsafe { std::ptr::write_bytes(mem_ptr, 0, size_bytes); }
+            unsafe { std::ptr::write_bytes(mem_ptr, 0x00, size_bytes); }
 
             Some(
                 RWXMemory {
@@ -124,6 +125,14 @@ impl RWXMemory {
         let ptr = self.mem_ptr;
         std::mem::forget(self);
         ptr
+    }
+
+    //TODO add from_raw function (will also need the length)
+    unsafe fn from_raw(ptr: std::ptr::NonNull<u8>, len: usize) -> Self {
+        RWXMemory {
+            mem_ptr: ptr,
+            mem_len: len
+        }
     }
 }
 
@@ -157,7 +166,7 @@ impl JITMemory {
         if self.remaining_space() < bytes.len() {
             Err(())
         } else {
-            let group_start_index;
+            let group_start_index;//Inclusive
             if self.group_ends.is_empty() {
                 group_start_index = 0;
             } else {
@@ -172,13 +181,29 @@ impl JITMemory {
         }
     }
 
+    fn get_byte_group(&mut self, group: usize) -> Option<&mut [u8]> {
+        if self.num_byte_groups() == 0 {
+            None
+        } else {
+            let group_start_index;//Inclusive
+            if group == 0 {
+                group_start_index = 0;
+            } else {
+                group_start_index = self.group_ends[group - 1];
+            }
+            let group_end_index = self.group_ends[group];//Exclusive
+
+            Some(&mut self.memory[group_start_index..group_end_index])
+        }
+    }
+
     //You will likely have to transmute the function pointer to the correct type for your purposes
     //Probably with something like let myfn: extern "C" fn(args) -> ret = unsafe { std::mem::transmute(jitmemory.fn_ptr_to_group()?) };
     fn fn_ptr_to_group(&self, group: usize) -> Option<unsafe fn()> {
         if self.num_byte_groups() == 0 {
             None
         } else {
-            let mut base_memory_ptr = self.memory.as_ptr();
+            let base_memory_ptr = self.memory.as_ptr();
         
             if group == 0 {
                 Some(unsafe { std::mem::transmute(base_memory_ptr) })
